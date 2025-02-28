@@ -112,6 +112,7 @@ function doPost(e) {
     
     // 注意: キューには追加しない
     // processQueuedMessages関数による二重処理を防ぐため、キューには追加しません
+    // 以前はここで addMessageToQueue(requestId) を呼び出していたが、削除した
     
     // ステップ3: 即時レスポンスを返す（HTTP 200）
     // ここが重要: LINEプラットフォームのタイムアウト（3秒）を回避するため、
@@ -198,6 +199,10 @@ function processMessageAsync(requestId) {
         // LINEに応答を送信
         sendMessage(replyToken, replyText);
         
+        // 処理済みフラグをキャッシュに保存（二重処理防止）
+        const processedKey = `processed_${requestId}`;
+        CacheService.getScriptCache().put(processedKey, 'true', 21600); // 6時間キャッシュを保持
+        
         // ログに追加（非同期で実行可能）
         debugLog(lineUserId, postMessage, replyText);
         debugLogIndividual(userSheetName, postMessage, replyText);
@@ -214,42 +219,36 @@ function processMessageAsync(requestId) {
 }
 
 /**
- * トリガーを設定する関数
+ * トリガーを削除する関数
  * 
- * この関数は、定期的にキューを処理するためのトリガーを設定します。
+ * この関数は、キュー処理用のトリガーを削除します。
+ * 二重処理の問題を解決するために、キュー処理を無効化します。
  * スクリプトエディタから手動で実行する必要があります。
- * 
- * 重要: この関数を一度実行して、トリガーを設定してください。
- * トリガーが設定されていないと、キューに溜まったメッセージが処理されません。
  */
 function setupTriggers() {
   // 既存のトリガーをクリア
   const triggers = ScriptApp.getProjectTriggers();
+  let deletedCount = 0;
+  
   for (let i = 0; i < triggers.length; i++) {
     if (triggers[i].getHandlerFunction() === 'processQueuedMessages') {
       ScriptApp.deleteTrigger(triggers[i]);
+      deletedCount++;
     }
   }
   
-  // 1分ごとに実行するトリガーを設定
-  ScriptApp.newTrigger('processQueuedMessages')
-    .timeBased()
-    .everyMinutes(1)
-    .create();
-  
-  // トリガーが正常に設定されたことを確認
-  const newTriggers = ScriptApp.getProjectTriggers();
-  const queueTriggers = newTriggers.filter(trigger => 
-    trigger.getHandlerFunction() === 'processQueuedMessages'
-  );
-  
-  if (queueTriggers.length > 0) {
-    console.log("キュー処理用トリガーが正常に設定されました");
-    return "トリガーが正常に設定されました。キューの処理が1分ごとに行われます。";
+  // トリガーが削除されたことを確認
+  if (deletedCount > 0) {
+    console.log(`${deletedCount}個のキュー処理用トリガーを削除しました`);
+    return `${deletedCount}個のキュー処理用トリガーを削除しました。これにより二重処理の問題が解決されます。`;
   } else {
-    console.log("トリガーの設定に失敗しました");
-    return "トリガーの設定に失敗しました。手動でトリガーを設定してください。";
+    console.log("削除すべきトリガーが見つかりませんでした");
+    return "削除すべきトリガーが見つかりませんでした。既にトリガーが削除されている可能性があります。";
   }
+  
+  // 注意: 以前はここで新しいトリガーを作成していましたが、
+  // 二重処理の問題を解決するために、トリガーの作成を停止しました。
+  // 即時処理のみを行うことで、メッセージが2回処理される問題を解決します。
 }
 
 /**
@@ -314,36 +313,45 @@ function processQueuedMessages() {
   // 複数のChatGPTリクエストを一括で処理することで効率化
   const chatGPTRequests = [];
   
-  // ステップ4: バッチ内の各リクエストを処理
-  batch.forEach(requestId => {
-    try {
-      // キャッシュからリクエストデータを取得
-      const cachedData = cache.get(requestId);
-      if (!cachedData) {
-        console.log(`キャッシュデータが見つかりません: ${requestId}`);
-        return;
-      }
-      
-      const requestData = JSON.parse(cachedData);
-      const data = requestData.data;
-      
-      // メッセージタイプのリクエストをChatGPTバッチ処理用に収集
-      // テキストメッセージのみをChatGPTバッチ処理の対象とする
-      if (data.type === "message" && data.message.type === "text") {
-        const lineUserId = data.source.userId;
-        const userSheetName = findUserSheetName(lineUserId);
-        const postMessage = data.message.text;
-        const totalMessages = chatGPTLog(userSheetName, postMessage);
-        
-        // バッチ処理用のリクエスト情報を収集
-        chatGPTRequests.push({
-          userId: lineUserId,
-          totalMessages: totalMessages,
-          requestId: requestId,
-          replyToken: data.replyToken,
-          postMessage: postMessage,
-          userSheetName: userSheetName
-        });
+      // ステップ4: バッチ内の各リクエストを処理
+      batch.forEach(requestId => {
+        try {
+          // 処理済みフラグをチェック（二重処理防止）
+          const processedKey = `processed_${requestId}`;
+          const isProcessed = cache.get(processedKey);
+          
+          if (isProcessed) {
+            console.log(`リクエスト ${requestId} は既に処理済みです。スキップします。`);
+            return;
+          }
+          
+          // キャッシュからリクエストデータを取得
+          const cachedData = cache.get(requestId);
+          if (!cachedData) {
+            console.log(`キャッシュデータが見つかりません: ${requestId}`);
+            return;
+          }
+          
+          const requestData = JSON.parse(cachedData);
+          const data = requestData.data;
+          
+          // メッセージタイプのリクエストをChatGPTバッチ処理用に収集
+          // テキストメッセージのみをChatGPTバッチ処理の対象とする
+          if (data.type === "message" && data.message.type === "text") {
+            const lineUserId = data.source.userId;
+            const userSheetName = findUserSheetName(lineUserId);
+            const postMessage = data.message.text;
+            const totalMessages = chatGPTLog(userSheetName, postMessage);
+            
+            // バッチ処理用のリクエスト情報を収集
+            chatGPTRequests.push({
+              userId: lineUserId,
+              totalMessages: totalMessages,
+              requestId: requestId,
+              replyToken: data.replyToken,
+              postMessage: postMessage,
+              userSheetName: userSheetName
+            });
       } else {
         // ChatGPT以外のリクエスト（フォローイベントなど）は個別に処理
         processMessageAsync(requestId);
@@ -370,6 +378,10 @@ function processQueuedMessages() {
           if (request) {
             // LINEに応答を送信
             sendMessage(request.replyToken, result.response);
+            
+            // 処理済みフラグをキャッシュに保存（二重処理防止）
+            const processedKey = `processed_${request.requestId}`;
+            cache.put(processedKey, 'true', 21600); // 6時間キャッシュを保持
             
             // ログに追加
             debugLog(request.userId, request.postMessage, result.response);
