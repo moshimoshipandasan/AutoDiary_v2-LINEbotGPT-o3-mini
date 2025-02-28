@@ -28,7 +28,98 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('カスタムメニュー')
     .addItem('アクティブセルlineUserIdにメッセージを送る', 'sendMessageToActiveCellUser')
+    .addItem('重複ユーザーIDを削除', 'removeDuplicateUsers')
     .addToUi();
+}
+
+// 重複するユーザーIDを検出して削除する関数
+function removeDuplicateUsers() {
+  // ロックを取得して競合を防止
+  const lock = LockService.getScriptLock();
+  try {
+    // ロックを取得（最大10秒待機、30秒間ロック）
+    lock.tryLock(10000);
+    
+    const ui = SpreadsheetApp.getUi();
+    
+    // 確認ダイアログを表示
+    const response = ui.alert(
+      '重複ユーザーの削除',
+      '重複するユーザーIDを持つユーザーを削除します。この操作は元に戻せません。続行しますか？',
+      ui.ButtonSet.YES_NO
+    );
+    
+    // ユーザーがキャンセルした場合
+    if (response !== ui.Button.YES) {
+      ui.alert('操作はキャンセルされました。');
+      return;
+    }
+    
+    // ユーザーシートのデータを取得
+    const userData = SHEET_USER.getDataRange().getValues();
+    const headerRow = userData[0]; // ヘッダー行を保存
+    
+    // ユーザーIDをキーとして、行インデックスを保存するマップ
+    const userIdMap = new Map();
+    // 削除する行のインデックスを保存する配列
+    const rowsToDelete = [];
+    
+    // ヘッダー行をスキップして処理
+    for (let i = 1; i < userData.length; i++) {
+      const userId = userData[i][0];
+      
+      // ユーザーIDが空の場合はスキップ
+      if (!userId) continue;
+      
+      // このユーザーIDが既に見つかっている場合
+      if (userIdMap.has(userId)) {
+        // 重複行として削除対象に追加
+        rowsToDelete.push(i + 1); // スプレッドシートの行番号は1から始まるため+1
+      } else {
+        // 初めて見つかったユーザーIDを記録
+        userIdMap.set(userId, i);
+      }
+    }
+    
+    // 削除する行がない場合
+    if (rowsToDelete.length === 0) {
+      ui.alert('重複するユーザーIDは見つかりませんでした。');
+      return;
+    }
+    
+    // 行を削除する（後ろから削除しないと行番号がずれる）
+    rowsToDelete.sort((a, b) => b - a); // 降順にソート
+    
+    for (const rowIndex of rowsToDelete) {
+      SHEET_USER.deleteRow(rowIndex);
+    }
+    
+    // 削除結果を表示
+    ui.alert(`${rowsToDelete.length}件の重複ユーザーを削除しました。`);
+    
+    // キャッシュをクリア
+    const cache = CacheService.getScriptCache();
+    cache.remove('allUserData');
+    
+    // ログに記録
+    console.log(`重複ユーザー削除: ${rowsToDelete.length}件削除しました`);
+    SHEET_CHECK.appendRow(["重複ユーザー削除", `${rowsToDelete.length}件削除`, new Date()]);
+    
+  } catch (error) {
+    console.error('重複ユーザー削除エラー: ' + error.message);
+    // エラーログを記録
+    try {
+      SHEET_CHECK.appendRow(["重複ユーザー削除エラー", error.message, new Date()]);
+      SpreadsheetApp.getUi().alert('エラーが発生しました: ' + error.message);
+    } catch (e) {
+      console.error('エラーログ記録失敗: ' + e.message);
+    }
+  } finally {
+    // 必ずロックを解放
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
 }
 
 // LINEからのメッセージ受信（非同期処理を導入）
@@ -296,6 +387,16 @@ function addUser(userId) {
     // ロックを取得（最大10秒待機、30秒間ロック）
     lock.tryLock(10000);
     
+    // 重複チェック - ユーザーIDが既に存在するか確認
+    const userData = SHEET_USER.getDataRange().getValues();
+    for (let i = 0; i < userData.length; i++) {
+      if (userData[i][0] === userId) {
+        // 既存のユーザーが見つかった場合、そのシート名を返す
+        console.log('既存ユーザーが見つかりました: ' + userId);
+        return userData[i][4];
+      }
+    }
+    
     const userName = getUserDisplayName(userId); // ユーザーのプロフィール名を取得
     const userIMG  = getUserDisplayIMG(userId); // ユーザーのプロフィール画像URLを取得
     const sheetName = userName + userId.substring(1, 5); // シート名を userName + userIdの2~5文字で設定
@@ -327,6 +428,7 @@ function addUser(userId) {
     const nextRow = SHEET_USER.getLastRow() + 1;
     SHEET_USER.getRange(nextRow, 1, 1, 7).setValues(userValues);
     
+    console.log('新規ユーザーを追加しました: ' + userId);
     return sheetName; // 作成または取得したシート名を返す
   } finally {
     // 必ずロックを解放
