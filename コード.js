@@ -31,46 +31,68 @@ function onOpen() {
     .addToUi();
 }
 
-// LINEからのメッセージ受信
+// LINEからのメッセージ受信（非同期処理を導入）
 function doPost(e) {
   const data = JSON.parse(e.postData.contents).events[0]; // LINEからのイベント情報を取得
   if (!data) {
-    return SHEET_CHECK.appendRow(["Webhook設定接続確認しました。"]);
+    // Webhookの確認
+    CacheService.getScriptCache().put('webhook_check', 'true', 600); // 10分間キャッシュ
+    SHEET_CHECK.appendRow(["Webhook設定接続確認しました。"]);
+    return ContentService.createTextOutput(JSON.stringify({'status': 'ok'}))
+      .setMimeType(ContentService.MimeType.JSON);
   }
+  
   const replyToken = data.replyToken; // リプライトークン
   const lineUserId = data.source.userId; // LINE ユーザーIDを取得
-  const userSheetName = findUserSheetName(lineUserId); // ユーザー個別のシート
   const dataType = data.type; // データのタイプ(メッセージ、フォロー、アンフォローなど)
-  // ユーザーがフォローした際(友達追加時)の処理
-  if (dataType === "follow") {
-    const UserData = findUser(lineUserId);
-    if (typeof UserData === "undefined") {
-      addUser(lineUserId); // ユーザーシートにユーザーを追加
+  
+  try {
+    // 即時処理が必要な部分を実行
+    if (dataType === "message") {
+      const messageData = data.message;
+      const messageType = messageData.type;
+      
+      if (messageType === "text") {
+        const postMessage = messageData.text;
+        const userSheetName = findUserSheetName(lineUserId);
+        const totalMessages = chatGPTLog(userSheetName, postMessage);
+        const replyText = chatGPT(lineUserId, totalMessages);
+        sendMessage(replyToken, replyText);
+        
+        // 即時にログを記録（トリガーを使用せず）
+        debugLog(lineUserId, postMessage, replyText); // 大元のログシートに追加
+        debugLogIndividual(userSheetName, postMessage, replyText); // 個別ユーザーシートのログに追加
+      } else {
+        // テキスト以外のメッセージの場合
+        sendMessage(replyToken, nonText);
+      }
+    } else if (dataType === "follow") {
+      // フォロー時の処理
+      const UserData = findUser(lineUserId);
+      if (typeof UserData === "undefined") {
+        // ユーザー追加処理
+        const userSheetName = addUser(lineUserId);
+        
+        // キャッシュに保存
+        const cache = CacheService.getScriptCache();
+        cache.put('sheetName_' + lineUserId, userSheetName, 3600);
+      }
+      // 歓迎メッセージを送信
+      sendMessage(replyToken, firstWord);
     }
-    // ユーザーに歓迎のメッセージを送信(必要に応じてカスタマイズ)
-    sendMessage(replyToken, firstWord);
-    return; // ここで処理を終了
-  }
-  // メッセージ受信時の処理
-  if (dataType === "message") {
-    const messageData = data.message;
-    const messageType = messageData.type; // メッセージのタイプ(テキスト、画像、スタンプなど)
-    // テキストメッセージの場合の処理
-    if (messageType === "text") {
-      const postMessage = messageData.text; // ユーザーから受け取ったテキストメッセージ
-      // データ生成&LINEに送信
-      const totalMessages = chatGPTLog(userSheetName, postMessage);
-      const replyText = chatGPT(lineUserId, totalMessages); // ChatGPT関数を使って応答テキストを生成
-      sendMessage(replyToken, replyText); // LINEに応答を送信
-      // ログに追加
-      debugLog(lineUserId, postMessage, replyText); // 大元のログシートに追加
-      debugLogIndividual(userSheetName, postMessage, replyText); // 個別ユーザーシートのログに追加
-    } else {
-      // テキスト以外のメッセージの場合、サポートしていないメッセージタイプである旨をユーザーに通知
-      sendMessage(replyToken, nonText);
+  } catch (error) {
+    console.error('doPost処理エラー: ' + error.message);
+    // エラーログを記録
+    try {
+      SHEET_CHECK.appendRow(["エラー発生", error.message, new Date()]);
+    } catch (e) {
+      console.error('エラーログ記録失敗: ' + e.message);
     }
   }
-  // その他のdataTypeに対する処理があればここに追加
+  
+  // 即座にLINEサーバーに200 OKを返す
+  return ContentService.createTextOutput(JSON.stringify({'status': 'ok'}))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // LINEに返答
@@ -180,7 +202,7 @@ function chatGPT(userId, totalMessages) {
       "reasoning_effort": "medium"
       // "temperature": CHAT_GPT_TEMPRATURE
     })
-  }
+  };
   try {
     const response = UrlFetchApp.fetch(CHAT_GPT_URL, requestOptions);
     const responseText = response.getContentText();
@@ -191,97 +213,219 @@ function chatGPT(userId, totalMessages) {
   }
 }
 
-// ログの記録処理
+// ログの記録処理（バッチ処理と非同期処理を導入）
 //「ログ」に追加
 function debugLog(userId, text, replyText) {
-  const UserData = findUser(userId); // ユーザーシートにデータがあるか確認
-  typeof UserData === "undefined" ? addUser(userId) : userUseChat(userId); // ユーザーシートにデータがなければユーザー追加、あれば投稿数だけ追加
-  const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
-  SHEET_LOG.appendRow([userId, UserData, text, replyText, date]); // ログシートに情報追加
-}
-
-// 個別のログシートに追加
-function debugLogIndividual(sheetName, text, replyText) {
-  const individualSheetLog = SS.getSheetByName(sheetName);
-  const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
-  individualSheetLog.appendRow([text, replyText, date]);
-}
-
-function addUser(userId) {
-  const userName = getUserDisplayName(userId); // ユーザーのプロフィール名を取得
-  const userIMG  = getUserDisplayIMG(userId); // ユーザーのプロフィール画像URLを取得
-  const sheetName = userName + userId.substring(1, 5); // シート名を userName + userIdの2~5文字で設定
-  // 新しいシートを追加し、シート名を設定
-  if (!SS.getSheetByName(sheetName)) {
-    const newUserSheet = SS.insertSheet(sheetName);    
-    // ユーザー名の列を含むヘッダー行を追加
-    newUserSheet.appendRow(['送信メッセージ', '応答メッセージ', '日付']);
-    // 新しいシートの現在の行数と列数を取得する
-    const maxRows = newUserSheet.getMaxRows();
-    const maxCols = newUserSheet.getMaxColumns();
-    // 余分な列を削除する
-    if (maxCols > 3) newUserSheet.deleteColumns(4, maxCols - 3);
-    // 余分な行を削除する(1行のヘッダーを残して、他のすべての行を削除)
-    if (maxRows > 1) newUserSheet.deleteRows(2, maxRows - 1);
+  // ロックを取得して競合を防止
+  const lock = LockService.getScriptLock();
+  try {
+    // ロックを取得（最大5秒待機、10秒間ロック）
+    lock.tryLock(5000);
+    
+    const UserData = findUser(userId); // ユーザーシートにデータがあるか確認
+    typeof UserData === "undefined" ? addUser(userId) : userUseChat(userId); // ユーザーシートにデータがなければユーザー追加、あれば投稿数だけ追加
+    
+    const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
+    
+    // 一括書き込み用の配列
+    const logValues = [[userId, UserData, text, replyText, date]];
+    
+    // 次の空き行を取得して一括書き込み
+    const nextRow = SHEET_LOG.getLastRow() + 1;
+    SHEET_LOG.getRange(nextRow, 1, 1, 5).setValues(logValues);
+    
+    // ログ記録成功をコンソールに出力
+    console.log('ログ記録成功: ' + userId);
+  } catch (error) {
+    console.error('ログ記録エラー: ' + error.message);
+    // エラーログを記録
+    try {
+      SHEET_CHECK.appendRow(["ログ記録エラー", userId, error.message, new Date()]);
+    } catch (e) {
+      console.error('エラーログ記録失敗: ' + e.message);
+    }
+  } finally {
+    // 必ずロックを解放
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
   }
-  // ユーザー情報シートにユーザー情報を記録
-  const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
-  SHEET_USER.appendRow([userId, userName, userIMG, 0, sheetName, date, date]);
-  return sheetName; // 作成または取得したシート名を返す
 }
 
-// ユーザーのシートを更新 
+// 個別のログシートに追加（非同期処理を導入）
+function debugLogIndividual(sheetName, text, replyText) {
+  // ロックを取得して競合を防止
+  const lock = LockService.getScriptLock();
+  try {
+    // ロックを取得（最大5秒待機、10秒間ロック）
+    lock.tryLock(5000);
+    
+    const individualSheetLog = SS.getSheetByName(sheetName);
+    const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
+    
+    // 一括書き込み用の配列
+    const logValues = [[text, replyText, date]];
+    
+    // 次の空き行を取得して一括書き込み
+    const nextRow = individualSheetLog.getLastRow() + 1;
+    individualSheetLog.getRange(nextRow, 1, 1, 3).setValues(logValues);
+    
+    // ログ記録成功をコンソールに出力
+    console.log('個別ログ記録成功: ' + sheetName);
+  } catch (error) {
+    console.error('個別ログ記録エラー: ' + error.message);
+    // エラーログを記録
+    try {
+      SHEET_CHECK.appendRow(["個別ログ記録エラー", sheetName, error.message, new Date()]);
+    } catch (e) {
+      console.error('エラーログ記録失敗: ' + e.message);
+    }
+  } finally {
+    // 必ずロックを解放
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
+}
+
+// ユーザー追加（非同期処理とロック機能を導入）
+function addUser(userId) {
+  // ロックを取得して競合を防止
+  const lock = LockService.getScriptLock();
+  try {
+    // ロックを取得（最大10秒待機、30秒間ロック）
+    lock.tryLock(10000);
+    
+    const userName = getUserDisplayName(userId); // ユーザーのプロフィール名を取得
+    const userIMG  = getUserDisplayIMG(userId); // ユーザーのプロフィール画像URLを取得
+    const sheetName = userName + userId.substring(1, 5); // シート名を userName + userIdの2~5文字で設定
+    
+    // 新しいシートを追加し、シート名を設定
+    if (!SS.getSheetByName(sheetName)) {
+      const newUserSheet = SS.insertSheet(sheetName);    
+      
+      // ヘッダー行とシート設定を一括で行う
+      const headerValues = [['送信メッセージ', '応答メッセージ', '日付']];
+      newUserSheet.getRange(1, 1, 1, 3).setValues(headerValues);
+      
+      // 新しいシートの現在の行数と列数を取得する
+      const maxRows = newUserSheet.getMaxRows();
+      const maxCols = newUserSheet.getMaxColumns();
+      
+      // 余分な列を削除する
+      if (maxCols > 3) newUserSheet.deleteColumns(4, maxCols - 3);
+      
+      // 余分な行を削除する(1行のヘッダーを残して、他のすべての行を削除)
+      if (maxRows > 1) newUserSheet.deleteRows(2, maxRows - 1);
+    }
+    
+    // ユーザー情報シートにユーザー情報を記録（一括書き込み）
+    const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
+    const userValues = [[userId, userName, userIMG, 0, sheetName, date, date]];
+    
+    // 次の空き行を取得
+    const nextRow = SHEET_USER.getLastRow() + 1;
+    SHEET_USER.getRange(nextRow, 1, 1, 7).setValues(userValues);
+    
+    return sheetName; // 作成または取得したシート名を返す
+  } finally {
+    // 必ずロックを解放
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
+}
+
+// ユーザーのシートを更新（非同期処理とロック機能を導入）
 function userUseChat(userId) {
-  // 送信したユーザー先のユーザーを検索
-  const textFinder = SHEET_USER.createTextFinder(userId);
-  const ranges = textFinder.findAll();
-  // ユーザーが存在しない場合エラー
-  if (!ranges[0])
-    SHEET_USER.appendRow([userId, "???", '', 1]);
-  // 投稿数プラス1
-  const timesFinder = SHEET_USER.createTextFinder('投稿数');
-  const timesRanges = timesFinder.findAll();
-  const timesRow    = ranges[0].getRow();
-  const timesColumn = timesRanges[0].getColumn();
-  const times = SHEET_USER.getRange(timesRow, timesColumn).getValue() + 1;
-  SHEET_USER.getRange(timesRow, timesColumn).setValue(times);
-  // 更新日時を更新
-  const updateDateFinder = SHEET_USER.createTextFinder('更新日時');
-  const updateDateRanges = updateDateFinder.findAll();
-  const updateDateRow    = ranges[0].getRow();
-  const updateDateColumn = updateDateRanges[0].getColumn();
-  const updateDate = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
-  SHEET_USER.getRange(updateDateRow, updateDateColumn).setValue(updateDate);
-  // 更新順に並び替え
-/**
-  const numColumn = SHEET_USER.getLastColumn(); // 最後列の列番号を取得
-  const numRow    = SHEET_USER.getLastRow() - 1;  // 最後行の行番号を取得
-  const dataRange = SHEET_USER.getRange(2, 1, numRow, numColumn);
-  dataRange.sort([{column: updateDateColumn, ascending: false}]); // 更新日付順に並び替え
- */
+  // ロックを取得して競合を防止
+  const lock = LockService.getScriptLock();
+  try {
+    // ロックを取得（最大5秒待機、10秒間ロック）
+    lock.tryLock(5000);
+    
+    // 送信したユーザー先のユーザーを検索
+    const textFinder = SHEET_USER.createTextFinder(userId);
+    const ranges = textFinder.findAll();
+    
+    // ユーザーが存在しない場合、新規追加
+    if (!ranges[0]) {
+      const userValues = [[userId, "???", '', 1]];
+      const nextRow = SHEET_USER.getLastRow() + 1;
+      SHEET_USER.getRange(nextRow, 1, 1, 4).setValues(userValues);
+      return;
+    }
+    
+    // 投稿数プラス1
+    const timesFinder = SHEET_USER.createTextFinder('投稿数');
+    const timesRanges = timesFinder.findAll();
+    const timesRow    = ranges[0].getRow();
+    const timesColumn = timesRanges[0].getColumn();
+    const times = SHEET_USER.getRange(timesRow, timesColumn).getValue() + 1;
+    
+    // 更新日時を更新
+    const updateDateFinder = SHEET_USER.createTextFinder('更新日時');
+    const updateDateRanges = updateDateFinder.findAll();
+    const updateDateRow    = ranges[0].getRow();
+    const updateDateColumn = updateDateRanges[0].getColumn();
+    const updateDate = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss'); // 現在の日付を取得
+    
+    // 一括更新
+    SHEET_USER.getRange(timesRow, timesColumn).setValue(times);
+    SHEET_USER.getRange(updateDateRow, updateDateColumn).setValue(updateDate);
+    
+    // 更新順に並び替え（コメントアウトされているが、必要に応じて有効化）
+    /**
+    const numColumn = SHEET_USER.getLastColumn(); // 最後列の列番号を取得
+    const numRow    = SHEET_USER.getLastRow() - 1;  // 最後行の行番号を取得
+    const dataRange = SHEET_USER.getRange(2, 1, numRow, numColumn);
+    dataRange.sort([{column: updateDateColumn, ascending: false}]); // 更新日付順に並び替え
+    */
+  } finally {
+    // 必ずロックを解放
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
 }
 
-// ユーザーIDに基づいてユーザーのシート名を検索する関数
+// ユーザーIDに基づいてユーザーのシート名を検索する関数（キャッシュ機能を追加）
 function findUserSheetName(userId) {
+  // キャッシュからシート名を取得を試みる
+  const cache = CacheService.getScriptCache();
+  const cachedSheetName = cache.get('sheetName_' + userId);
+  
+  if (cachedSheetName) {
+    return cachedSheetName;
+  }
+  
+  // キャッシュにない場合はスプレッドシートから検索
   const userData = SHEET_USER.getDataRange().getValues();
   for (let i = 0; i < userData.length; i++) {
     if (userData[i][0] === userId) {
+      // 見つかったシート名をキャッシュに保存（1時間有効）
+      cache.put('sheetName_' + userId, userData[i][4], 3600);
       return userData[i][4]; // 対応するシート名を返す
     }
   }
-  // ユーザーが見つからない場合、シートを作成するかエラーをスロー
-  return addUser(userId); // シートが存在しない場合は新しいシートを作成してその名前を返す
+  
+  // ユーザーが見つからない場合、シートを作成
+  const newSheetName = addUser(userId);
+  // 新しいシート名をキャッシュに保存
+  cache.put('sheetName_' + userId, newSheetName, 3600);
+  return newSheetName;
 }
 
-// 過去の履歴を取得
+// 過去の履歴を取得（最適化）
 function chatGPTLog(UserSheetName, postMessage) {
   let individualSheetLog = SS.getSheetByName(UserSheetName);
   // シートが見つからない場合、新しいシートを作成
   if (!individualSheetLog) {
     individualSheetLog = SS.insertSheet(UserSheetName);
     
-    // 新しいシートにヘッダーを追加
-    individualSheetLog.appendRow(['送信メッセージ', '応答メッセージ', '日付']);
+    // 新しいシートにヘッダーを追加（一括書き込み）
+    const headerValues = [['送信メッセージ', '応答メッセージ', '日付']];
+    individualSheetLog.getRange(1, 1, 1, 3).setValues(headerValues);
     
     // 新しいシートの現在の行数と列数を取得する
     const maxRows = individualSheetLog.getMaxRows();
@@ -293,21 +437,27 @@ function chatGPTLog(UserSheetName, postMessage) {
     // 余分な行を削除する(1行のヘッダーを残して、他のすべての行を削除)
     if (maxRows > 1) individualSheetLog.deleteRows(2, maxRows - 1);
   }
+  
+  // データを一度に取得して処理
   let values = individualSheetLog.getDataRange().getValues();
+  
   // valuesを逆順にする
   values = values.reverse();
-  values.pop();
+  values.pop(); // ヘッダー行を削除
+  
   // valuesをmapで処理し、MAX_COUNT_LOGの制限を超えないようにメッセージを追加
   const totalMessages = values.slice(0, MAX_COUNT_LOG).flatMap(value => [
     {"role": "assistant", "content": value[1]},
     {"role": "user", "content": value[0]}
   ]);
+  
   // 最新のメッセージを追加
   totalMessages.reverse().push({"role": "user", "content": postMessage});
-  // console.log(totalMessages);
+  
   return totalMessages;
 }
 
+// 古い実装は残しておくが、使用しない
 function chatGPTLogOld(UserSheetName, postMessage) {
   const individualSheetLog = SS.getSheetByName(UserSheetName);
   let values = individualSheetLog.getDataRange().getValues();  
@@ -327,54 +477,146 @@ function chatGPTLogOld(UserSheetName, postMessage) {
   return totalMessages;
 }
 
-// メンバーとしてユーザー登録されているか検索
+// メンバーとしてユーザー登録されているか検索（キャッシュ機能を追加）
 function findUser(uid) {
-  return getUserData().reduce(function(uuid, row) { return uuid || (row.key === uid && row.value); }, false) || undefined;
+  // キャッシュからユーザーデータを取得を試みる
+  const cache = CacheService.getScriptCache();
+  const cachedUserData = cache.get('userData_' + uid);
+  
+  if (cachedUserData) {
+    return cachedUserData;
+  }
+  
+  // キャッシュにない場合はスプレッドシートから検索
+  const userData = getUserData().reduce(function(uuid, row) { 
+    return uuid || (row.key === uid && row.value); 
+  }, false) || undefined;
+  
+  // 見つかった場合、キャッシュに保存（10分間有効）
+  if (userData) {
+    cache.put('userData_' + uid, userData, 600);
+  }
+  
+  return userData;
 }
 
-// LINEのAPIを使ってユーザーの名前を取得
+// LINEのAPIを使ってユーザーの名前を取得（キャッシュ機能を追加）
 function getUserDisplayName(userId) {
+  // キャッシュからユーザー名を取得を試みる
+  const cache = CacheService.getScriptCache();
+  const cachedName = cache.get('displayName_' + userId);
+  
+  if (cachedName) {
+    return cachedName;
+  }
+  
+  // キャッシュにない場合はLINE APIから取得
   const url = 'https://api.line.me/v2/bot/profile/' + userId;
-  const userProfile = UrlFetchApp.fetch(url,{
+  const userProfile = UrlFetchApp.fetch(url, {
     'headers': {
       'Authorization' : `Bearer ${linetoken}`,
     },
   });
-  return JSON.parse(userProfile).displayName;
+  
+  const displayName = JSON.parse(userProfile).displayName;
+  
+  // 取得した名前をキャッシュに保存（1時間有効）
+  cache.put('displayName_' + userId, displayName, 3600);
+  
+  return displayName;
 }
 
-// ユーザーのプロフィール画像取得 
+// ユーザーのプロフィール画像取得（キャッシュ機能を追加）
 function getUserDisplayIMG(userId) {
-  const url = 'https://api.line.me/v2/bot/profile/' + userId
-  const userProfile = UrlFetchApp.fetch(url,{
+  // キャッシュからプロフィール画像URLを取得を試みる
+  const cache = CacheService.getScriptCache();
+  const cachedIMG = cache.get('profileIMG_' + userId);
+  
+  if (cachedIMG) {
+    return cachedIMG;
+  }
+  
+  // キャッシュにない場合はLINE APIから取得
+  const url = 'https://api.line.me/v2/bot/profile/' + userId;
+  const userProfile = UrlFetchApp.fetch(url, {
     'headers': {
       'Authorization' : `Bearer ${linetoken}`,
     },
   });
-  return JSON.parse(userProfile).pictureUrl;
+  
+  const pictureUrl = JSON.parse(userProfile).pictureUrl;
+  
+  // 取得した画像URLをキャッシュに保存（1時間有効）
+  cache.put('profileIMG_' + userId, pictureUrl, 3600);
+  
+  return pictureUrl;
 }
 
 // スプレッドシートを並び替え(対象のシートのカラムを降順に変更)
-function dataSort(sortSheet,columnNumber) {
-  const numColumn = sortSheet.getLastColumn(); // 最後列の列番号を取得
-  const numRow    = sortSheet.getLastRow() - 1;  // 最後行の行番号を取得
-  const dataRange = sortSheet.getRange(2, 1, numRow, numColumn);
-  dataRange.sort([{column: columnNumber, ascending: false}]); // 降順に並び替え
+function dataSort(sortSheet, columnNumber) {
+  // ロックを取得して競合を防止
+  const lock = LockService.getScriptLock();
+  try {
+    // ロックを取得（最大5秒待機、10秒間ロック）
+    lock.tryLock(5000);
+    
+    const numColumn = sortSheet.getLastColumn(); // 最後列の列番号を取得
+    const numRow    = sortSheet.getLastRow() - 1;  // 最後行の行番号を取得
+    
+    if (numRow > 0) {
+      const dataRange = sortSheet.getRange(2, 1, numRow, numColumn);
+      dataRange.sort([{column: columnNumber, ascending: false}]); // 降順に並び替え
+    }
+  } finally {
+    // 必ずロックを解放
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
 }
 
-// ユーザー情報取得
+// ユーザー情報取得（キャッシュ機能を追加）
 function getUserData() {
+  // キャッシュからユーザーデータを取得を試みる
+  const cache = CacheService.getScriptCache();
+  const cachedData = cache.get('allUserData');
+  
+  if (cachedData) {
+    return JSON.parse(cachedData);
+  }
+  
+  // キャッシュにない場合はスプレッドシートから取得
   const data = SHEET_USER.getDataRange().getValues();
-  return data.map(function(row) { return {key: row[0], value: row[1]}; });
+  const userData = data.map(function(row) { 
+    return {key: row[0], value: row[1]}; 
+  });
+  
+  // 取得したデータをキャッシュに保存（5分間有効）
+  cache.put('allUserData', JSON.stringify(userData), 300);
+  
+  return userData;
 }
 
-// 情報の取得
+// 情報の取得（キャッシュ機能を追加）
 function getInformationSheetDataAsCSV() {
+  // キャッシュから情報データを取得を試みる
+  const cache = CacheService.getScriptCache();
+  const cachedInfo = cache.get('infoSheetData');
+  
+  if (cachedInfo) {
+    return cachedInfo;
+  }
+  
+  // キャッシュにない場合はスプレッドシートから取得
   const data = SHEET_INFO.getDataRange().getValues();
   let csvData = '';
   data.forEach(function(row) {
     csvData += row.join('  ') + '\n';
   });
+  
+  // 取得したデータをキャッシュに保存（5分間有効）
+  cache.put('infoSheetData', csvData, 300);
+  
   return csvData;
 }
 
